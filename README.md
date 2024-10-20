@@ -48,7 +48,7 @@ pip install -r requirements.txt
 ## Run Experiments
 Before running, make sure you have all the processed datasets put under `dataset/`. For Linux users, run each method's shell script in `scripts/classification/`. 
 You could also run all the experiments by running the `meta-run.py/` file, which the method included in _skip_list_ will not be run.
-For Windows users, see jupyter notebook `experimenets.ipynb`. All the experimental scripts are provided cell by cell. 
+For Windows users, see jupyter notebook files. All the experimental scripts are provided cell by cell. 
 The gpu device ids can be specified by setting command line `--devices` (e,g, `--devices 0,1,2,3`). 
 You also need to change the visible gpu devices in script file by setting `export CUDA_VISIBLE_DEVICES` (e,g, `export CUDA_VISIBLE_DEVICES=0,1,2,3`). 
 The gpu devices specified by commend line should be a subset of visible gpu devices.
