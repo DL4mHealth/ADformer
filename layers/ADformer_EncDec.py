@@ -51,13 +51,23 @@ class Encoder(nn.Module):
             attns_t.append(attn_t)
             attns_c.append(attn_c)
 
-        # concat all the outputs
+        """# concat all the outputs
         if x_t:
             x_t = torch.cat(x_t, dim=1)  # (batch_size, patch_num_1 + patch_num_2 + ... , d_model)
         else:
             x_t = None
         if x_c:
             x_c = torch.cat(x_c, dim=1)  # (batch_size, enc_in_1 + enc_in_2 + ... , d_model)
+        else:
+            x_c = None"""
+        # only concat the routers. router is the last patch/channel of each element in the list
+
+        if x_t:
+            x_t = torch.cat([x[:, -1, :].unsqueeze(1) for x in x_t], dim=1)   # (batch_size, len(patch_len_list), d_model)
+        else:
+            x_t = None
+        if x_c:
+            x_c = torch.cat([x[:, -1, :].unsqueeze(1) for x in x_c], dim=1)  # (batch_size, len(up_dim_list), d_model)
         else:
             x_c = None
 

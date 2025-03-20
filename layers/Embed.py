@@ -300,7 +300,8 @@ class TokenChannelEmbedding(nn.Module):
         ]
         self.value_embeddings_t = nn.ModuleList(linear_layers_t)
         self.value_embeddings_c = nn.ModuleList(linear_layers_c)
-        self.position_embedding = PositionalEmbedding(d_model=d_model)
+        self.position_embedding_t = PositionalEmbedding(d_model=d_model)
+        self.position_embedding_c = PositionalEmbedding(d_model=seq_len)
         self.dropout = nn.Dropout(dropout)
         self.augmentation = nn.ModuleList(
             [get_augmentation(aug) for aug in augmentation]
@@ -334,12 +335,14 @@ class TokenChannelEmbedding(nn.Module):
             # per granularity augmentation
             aug_idx = random.randint(0, len(self.augmentation) - 1)
             x_new_c = self.augmentation[aug_idx](x_copy)
+            # add positional embedding to tag each channel
+            x_new_c = x_new_c + self.position_embedding_c(x_new_c)
             # channel dimension
             x_new_c = value_embedding_c(x_new_c)  # (batch_size, enc_in, d_model)
             x_list_c.append(x_new_c)
 
         x_t = [
-            x + cxt + self.position_embedding(x)
+            x + cxt + self.position_embedding_t(x)
             for x, cxt in zip(x_list_t, self.learnable_embeddings_t)
         ]  # (batch_size, patch_num_1, d_model), (batch_size, patch_num_2, d_model), ...
         x_c = [

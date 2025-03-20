@@ -77,8 +77,8 @@ class Model(nn.Module):
             self.act = F.gelu
             self.dropout = nn.Dropout(configs.dropout)
             self.projection = nn.Linear(
-                configs.d_model * sum(patch_num_list) +
-                configs.d_model * sum(up_dim_list),
+                configs.d_model * len(patch_num_list) +
+                configs.d_model * len(up_dim_list),
                 configs.num_class,
             )
 
