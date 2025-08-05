@@ -1,150 +1,230 @@
-# This source code is provided for the purposes of scientific reproducibility
-# under the following limited license from Element AI Inc. The code is an
-# implementation of the N-BEATS model (Oreshkin et al., N-BEATS: Neural basis
-# expansion analysis for interpretable time series forecasting,
-# https://arxiv.org/abs/1905.10437). The copyright to the source code is
-# licensed under the Creative Commons - Attribution-NonCommercial 4.0
-# International license (CC BY-NC 4.0):
-# https://creativecommons.org/licenses/by-nc/4.0/.  Any commercial use (whether
-# for the benefit of third parties or internally in production) requires an
-# explicit license. The subject-matter of the N-BEATS model and associated
-# materials are the property of Element AI Inc. and may be subject to patent
-# protection. No license to patents is granted hereunder (whether express or
-# implied). Copyright © 2020 Element AI Inc. All rights reserved.
-
-"""
-Loss functions for PyTorch.
-"""
-
-import torch as t
-import torch.nn as nn
+import torch
+import torch.nn.functional as F
 import numpy as np
 import pdb
 
 
-def divide_no_nan(a, b):
+# compute the different contrastive loss
+
+def ts2vec_loss(z1, z2, alpha=0.5):
+    loss = torch.tensor(0., device=z1.device)
+    # counter for loop number
+    d = 0
+    # shorter the length of time sequence each loop
+    while z1.size(1) > 1:
+        loss += alpha * instance_loss(z1, z2)
+        loss += alpha * temporal_loss(z1, z2)
+        d += 1
+        z1 = F.max_pool1d(z1.transpose(1, 2), kernel_size=2).transpose(1, 2)
+        z2 = F.max_pool1d(z2.transpose(1, 2), kernel_size=2).transpose(1, 2)
+        return loss / d
+
+
+def instance_loss(z1, z2):
+    B, T, C = z1.size(0), z1.size(1), z1.size(2)
+    if B == 1:
+        return z1.new_tensor(0.)
+    z = torch.cat([z1, z2], dim=0)  # 2B x T x C
+    z = z.transpose(0, 1)  # T x 2B x C
+    sim = torch.matmul(z, z.transpose(1, 2))  # T x 2B x 2B
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]  # T 2B x (2B-1), left-down side, remove last zero column
+    logits += torch.triu(sim, diagonal=1)[:, :, 1:]  # T x 2B x (2B-1), right-up side, remove first zero column
+    logits = -F.log_softmax(logits, dim=-1)  # log softmax do dividing and log
+
+    i = torch.arange(B, device=z1.device)
+    # take all timestamps by [:,x,x]
+    # logits[:, i, B + i - 1] : right-up, takes r_i and r_j
+    # logits[:, B + i, i] : down-left, takes r_i_prime and r_j_prime
+    loss = (logits[:, i, B + i - 1].mean() + logits[:, B + i, i].mean()) / 2
+    return loss
+
+
+def temporal_loss(z1, z2):
+    B, T, C = z1.size(0), z1.size(1), z1.size(2)
+    if T == 1:
+        return z1.new_tensor(0.)
+    z = torch.cat([z1, z2], dim=1)  # B x 2T x C
+    sim = torch.matmul(z, z.transpose(1, 2))  # B x 2T x 2T
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]  # B x 2T x (2T-1)
+    logits += torch.triu(sim, diagonal=1)[:, :, 1:]
+    logits = -F.log_softmax(logits, dim=-1)
+
+    t = torch.arange(T, device=z1.device)
+    # take all samples by [:,x,x]
+    loss = (logits[:, t, T + t - 1].mean() + logits[:, T + t, t].mean()) / 2
+    return loss
+
+
+def moco_loss(q, k, queue, T=0.07):
+    device = q.device
+    # positive
+    l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+    # negative from queue
+    l_neg = torch.einsum('nc,ck->nk', [q, queue])
+
+    logits = torch.cat([l_pos, l_neg], dim=1)
+    logits /= T
+    labels = torch.zeros(logits.shape[0], dtype=torch.long).to(device)
+
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+
+def simclr_loss(z1, z2):
     """
-    a/b where the resulted NaN or Inf are replaced by 0.
+    Computes a sample-level contrastive loss for embeddings z1 and z2 as describe in SimCLR framework.
+
+    Args:
+        z1 (torch.Tensor): Embeddings from view 1, shape [B, H].
+        z2 (torch.Tensor): Embeddings from view 2, shape [B, H].
+
+    Returns:
+        torch.Tensor: The computed contrastive loss.
     """
-    result = a / b
-    result[result != result] = .0
-    result[result == np.inf] = .0
-    return result
+    # Normalize embeddings
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+
+    # Compute similarity matrix
+    sim_matrix = torch.mm(z1, z2.T)
+    sim_matrix_exp = torch.exp(sim_matrix / 0.1)
+
+    # Diagonal elements (positive pairs)
+    diag_elements = torch.diag(sim_matrix_exp)
+    triu_sum = sim_matrix_exp.sum(dim=1)
+    tril_sum = sim_matrix_exp.sum(dim=0)
+
+    # Loss terms for diagonal
+    loss_diag1 = -torch.mean(torch.log(diag_elements / triu_sum))
+    loss_diag2 = -torch.mean(torch.log(diag_elements / tril_sum))
+    loss = loss_diag1 + loss_diag2
+    loss_terms = 2
+
+    # Final loss normalization
+    return loss / loss_terms if loss_terms > 0 else 0
 
 
-class mape_loss(nn.Module):
-    def __init__(self):
-        super(mape_loss, self).__init__()
+def id_loss(z1, z2, id):
+    '''
+    Computes a contrastive loss for embeddings z1 and z2 based on subject ID pairing.
 
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        MAPE loss as defined in: https://en.wikipedia.org/wiki/Mean_absolute_percentage_error
+    Args:
+        z1 (torch.Tensor): Embeddings from view 1, shape [B, H].
+        z2 (torch.Tensor): Embeddings from view 2, shape [B, H].
+        id (torch.Tensor): Subject IDs corresponding to embeddings, shape [B].
 
-        :param forecast: Forecast values. Shape: batch, time
-        :param target: Target values. Shape: batch, time
-        :param mask: 0/1 mask. Shape: batch, time
-        :return: Loss value
-        """
-        weights = divide_no_nan(mask, target)
-        return t.mean(t.abs((forecast - target) * weights))
+    Returns:
+        torch.Tensor: The computed contrastive loss.
+    '''
+    # Ensure all tensors are on the same device
+    device = z1.device
 
+    # Normalize embeddings
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
 
-class smape_loss(nn.Module):
-    def __init__(self):
-        super(smape_loss, self).__init__()
+    # Compute similarity matrix
+    sim_matrix = torch.mm(z1, z2.T)
+    sim_matrix_exp = torch.exp(sim_matrix / 0.1)
 
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        sMAPE loss as defined in https://robjhyndman.com/hyndsight/smape/ (Makridakis 1993)
+    # Convert IDs to a boolean matrix for positive pairs
+    id_matrix = id.unsqueeze(1) == id.unsqueeze(0)  # Boolean matrix for matching IDs
 
-        :param forecast: Forecast values. Shape: batch, time
-        :param target: Target values. Shape: batch, time
-        :param mask: 0/1 mask. Shape: batch, time
-        :return: Loss value
-        """
-        return 200 * t.mean(divide_no_nan(t.abs(forecast - target),
-                                          t.abs(forecast.data) + t.abs(target.data)) * mask)
+    # Get upper and lower triangle indices
+    rows1, cols1 = torch.triu_indices(id.size(0), id.size(0), offset=1, device=device)
+    rows2, cols2 = torch.tril_indices(id.size(0), id.size(0), offset=-1, device=device)
 
+    triu_sum = sim_matrix_exp.sum(dim=1)
+    tril_sum = sim_matrix_exp.sum(dim=0)
 
-class mase_loss(nn.Module):
-    def __init__(self):
-        super(mase_loss, self).__init__()
-
-    def forward(self, insample: t.Tensor, freq: int,
-                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
-        """
-        MASE loss as defined in "Scaled Errors" https://robjhyndman.com/papers/mase.pdf
-
-        :param insample: Insample values. Shape: batch, time_i
-        :param freq: Frequency value
-        :param forecast: Forecast values. Shape: batch, time_o
-        :param target: Target values. Shape: batch, time_o
-        :param mask: 0/1 mask. Shape: batch, time_o
-        :return: Loss value
-        """
-        masep = t.mean(t.abs(insample[:, freq:] - insample[:, :-freq]), dim=1)
-        masked_masep_inv = divide_no_nan(mask, masep[:, None])
-        return t.mean(t.abs(target - forecast) * masked_masep_inv)
-
-
-def id_contrastive_loss(z1, z2, id):
-    id = id.cpu().detach().numpy()
-    str_pid = [str(i) for i in id]
-    str_pid = np.array(str_pid, dtype=object)
-    pid1, pid2 = np.meshgrid(str_pid, str_pid)
-    pid_matrix = pid1 + '-' + pid2
-    pids_of_interest = np.unique(str_pid + '-' + str_pid)  # unique combinations of pids of interest i.e. matching
-    bool_matrix_of_interest = np.zeros((len(str_pid), len(str_pid)))
-    for pid in pids_of_interest:
-        bool_matrix_of_interest += pid_matrix == pid
-    rows1, cols1 = np.where(np.triu(bool_matrix_of_interest, 1))  # upper triangle same patient combs
-    rows2, cols2 = np.where(np.tril(bool_matrix_of_interest, -1))  # down triangle same patient combs
-
-    B, H = z1.size(0), z1.size(1)
     loss = 0
-    z1 = t.nn.functional.normalize(z1, dim=1)
-    z2 = t.nn.functional.normalize(z2, dim=1)
-    # B x H
-    view1_array = z1
-    view2_array = z2
-    norm1_vector = view1_array.norm(dim=1).unsqueeze(0)
-    norm2_vector = view2_array.norm(dim=1).unsqueeze(0)
-    sim_matrix = t.mm(view1_array, view2_array.transpose(0, 1))
-    norm_matrix = t.mm(norm1_vector.transpose(0, 1), norm2_vector)
-    temperature = 0.1
-    argument = sim_matrix/(norm_matrix*temperature)
-    sim_matrix_exp = t.exp(argument)
-
-    # diag_elements = t.diag(sim_matrix_exp)
-
-    triu_sum = t.sum(sim_matrix_exp, 1)  # add column
-    tril_sum = t.sum(sim_matrix_exp, 0)  # add row
-
-    # loss_diag1 = -t.mean(t.log(diag_elements/triu_sum))
-    # loss_diag2 = -t.mean(t.log(diag_elements/tril_sum))
-
-    # loss = loss_diag1 + loss_diag2
-    # loss_terms = 2
     loss_terms = 0
 
-    # upper triangle same patient combs exist
-    if len(rows1) > 0:
-        triu_elements = sim_matrix_exp[rows1, cols1]  # row and column for upper triangle same patient combinations
-        loss_triu = -t.mean(t.log(triu_elements / triu_sum[rows1]))
-        loss += loss_triu  # technically need to add 1 more term for symmetry
+    # Upper triangle positive pairs
+    upper_mask = id_matrix[rows1, cols1].to(device)  # Ensure mask is on the correct device
+    if upper_mask.any():
+        selected_rows = rows1[upper_mask]
+        selected_cols = cols1[upper_mask]
+        triu_elements = sim_matrix_exp[selected_rows.to(device), selected_cols.to(device)]  # Move indices to correct device
+        loss_triu = -torch.mean(torch.log(triu_elements / triu_sum[selected_rows]))
+        loss += loss_triu
         loss_terms += 1
 
-    # down triangle same patient combs exist
-    if len(rows2) > 0:
-        tril_elements = sim_matrix_exp[rows2, cols2]  # row and column for down triangle same patient combinations
-        loss_tril = -t.mean(t.log(tril_elements / tril_sum[cols2]))
-        loss += loss_tril  # technically need to add 1 more term for symmetry
+    # Lower triangle positive pairs
+    lower_mask = id_matrix[rows2, cols2].to(device)  # Ensure mask is on the correct device
+    if lower_mask.any():
+        selected_rows = rows2[lower_mask]
+        selected_cols = cols2[lower_mask]
+        tril_elements = sim_matrix_exp[selected_rows.to(device), selected_cols.to(device)]  # Move indices to correct device
+        loss_tril = -torch.mean(torch.log(tril_elements / tril_sum[selected_cols]))
+        loss += loss_tril
         loss_terms += 1
 
-    if loss_terms == 0:
-        return 0
-    else:
-        loss = loss/loss_terms
-        return loss
+    # Final loss normalization
+    return loss / loss_terms if loss_terms > 0 else 0
+
+
+def simclr_id_loss(z1, z2, id, lambda1=0.25, lambda2=0.75):
+    '''
+    Computes a contrastive loss for embeddings z1 and z2 based on the SimCLR framework and subject ID pairing.
+
+    Args:
+        z1 (torch.Tensor): Embeddings from view 1, shape [B, H].
+        z2 (torch.Tensor): Embeddings from view 2, shape [B, H].
+        id (torch.Tensor): Subject IDs corresponding to embeddings, shape [B].
+
+    Returns:
+        torch.Tensor: The computed contrastive loss.
+    '''
+    # Ensure all tensors are on the same device
+    device = z1.device
+
+    # Normalize embeddings
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+
+    # Compute similarity matrix
+    sim_matrix = torch.mm(z1, z2.T)
+    sim_matrix_exp = torch.exp(sim_matrix / 0.1)
+
+    # Convert IDs to a boolean matrix for positive pairs
+    id_matrix = id.unsqueeze(1) == id.unsqueeze(0)  # Boolean matrix for matching IDs
+
+    # Get upper and lower triangle indices
+    rows1, cols1 = torch.triu_indices(id.size(0), id.size(0), offset=1, device=device)
+    rows2, cols2 = torch.tril_indices(id.size(0), id.size(0), offset=-1, device=device)
+
+    # Diagonal elements (positive pairs)
+    diag_elements = torch.diag(sim_matrix_exp)
+    triu_sum = sim_matrix_exp.sum(dim=1)
+    tril_sum = sim_matrix_exp.sum(dim=0)
+
+    # Loss terms for diagonal
+    loss_diag1 = -torch.mean(torch.log(diag_elements / triu_sum))
+    loss_diag2 = -torch.mean(torch.log(diag_elements / tril_sum))
+    sample_loss = (loss_diag1 + loss_diag2) / 2
+
+    subject_loss = 0
+    subject_loss_terms = 0
+    # Upper triangle positive pairs
+    upper_mask = id_matrix[rows1, cols1].to(device)  # Ensure mask is on the correct device
+    if upper_mask.any():
+        selected_rows = rows1[upper_mask]
+        selected_cols = cols1[upper_mask]
+        triu_elements = sim_matrix_exp[selected_rows.to(device), selected_cols.to(device)]  # Move indices to correct device
+        loss_triu = -torch.mean(torch.log(triu_elements / triu_sum[selected_rows]))
+        subject_loss += loss_triu
+        subject_loss_terms += 1
+
+    # Lower triangle positive pairs
+    lower_mask = id_matrix[rows2, cols2].to(device)  # Ensure mask is on the correct device
+    if lower_mask.any():
+        selected_rows = rows2[lower_mask]
+        selected_cols = cols2[lower_mask]
+        tril_elements = sim_matrix_exp[selected_rows.to(device), selected_cols.to(device)]  # Move indices to correct device
+        loss_tril = -torch.mean(torch.log(tril_elements / tril_sum[selected_cols]))
+        subject_loss += loss_tril
+        subject_loss_terms += 1
+
+    subject_loss /= subject_loss_terms  # Average over upper and lower triangle losses
+    return lambda1 * sample_loss + lambda2 * subject_loss

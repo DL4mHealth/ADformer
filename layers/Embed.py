@@ -1,15 +1,29 @@
 import copy
 import math
 import random
-
 import torch
 import torch.nn as nn
+import numpy as np
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch.nn.utils import weight_norm
 
 from layers.Augmentation import get_augmentation
 from data_provider.uea import bandpass_filter_func
+
+
+# 2-d relative coordinates for 19 channels. We define position from left to right, top to bottom.
+# Note that channels T3, T4, T5, T6 in old system are the same channels as T7, T8, P7, P8 in new system.
+# 'Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T3/T7', 'C3', 'Cz', 'C4', 'T4/T8',
+# 'T5/P7', 'P3', 'Pz', 'P4', 'T6/P8', 'O1', 'O2'
+
+CHANNEL_RELATIVE_COORDINATES = {
+    "Fp1": (2, 1), "Fp2": (4, 1),
+    "F7": (1, 2), "F3": (2, 2), "Fz": (3, 2), "F4": (4, 2), "F8": (5, 2),
+    "T3": (1, 3), "C3": (2, 3), "Cz": (3, 3), "C4": (4, 3), "T4": (5, 3),
+    "T5": (1, 4), "P3": (2, 4), "Pz": (3, 4), "P4": (4, 4), "T6": (5, 4),
+    "O1": (2, 5), "O2": (4, 5),
+}
 
 
 class PositionalEmbedding(nn.Module):
@@ -32,6 +46,33 @@ class PositionalEmbedding(nn.Module):
 
     def forward(self, x):
         return self.pe[:, : x.size(1)]
+
+
+class ChannelPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(ChannelPositionalEmbedding, self).__init__()
+        if (d_model // 2) % 2 != 0:
+            raise ValueError("d_model must be an even number for 2-D channel positional embedding.")
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, (d_model // 2)).float()
+        pe.require_grad = False
+
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (
+            torch.arange(0, (d_model // 2), 2).float() * -(math.log(10000.0) / (d_model // 2))
+        ).exp()
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        coordinates = torch.tensor(list(CHANNEL_RELATIVE_COORDINATES.values())).to(x.device)
+        x_axis = self.pe[:, coordinates[:, 0].long()]
+        y_axis = self.pe[:, coordinates[:, 1].long()]
+        return torch.cat([x_axis, y_axis], dim=-1)
 
 
 class TokenEmbedding(nn.Module):  # (batch_size, seq_len, enc_in)
@@ -213,6 +254,32 @@ class PatchEmbedding(nn.Module):
         return self.dropout(x), n_vars
 
 
+class ShallowNetEmbedding(nn.Module):
+    def __init__(self, c_in, d_model, dropout):
+        super().__init__()
+
+        self.shallow_net = nn.Sequential(
+            nn.Conv2d(1, d_model, (1, 25), (1, 1)),
+            nn.Conv2d(d_model, d_model, (c_in, 1), (1, 1)),
+            nn.BatchNorm2d(d_model),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4), (1, 2)),
+            nn.Dropout(dropout),
+        )
+
+        self.projection = nn.Sequential(
+            nn.Conv2d(d_model, d_model, (1, 1), stride=(1, 1)),
+        )
+
+    def forward(self, x):  # (batch_size, seq_len, enc_in)
+        x = x.permute(0, 2, 1).unsqueeze(1)  # Shape becomes (B, 1, C, T)
+        x = self.shallow_net(x)
+        x = self.projection(x)
+        # Rearrange the output to match the Transformer input format (B, patch_num, d_model)
+        x = rearrange(x, 'b d h w -> b (h w) d')
+        return x
+
+
 class CrossChannelTokenEmbedding(nn.Module):  # (batch_size, 1, enc_in, seq_len)
     def __init__(self, c_in, l_patch, d_model, stride=None):
         super().__init__()
@@ -235,7 +302,7 @@ class CrossChannelTokenEmbedding(nn.Module):  # (batch_size, 1, enc_in, seq_len)
 
     def forward(self, x):
         x = self.tokenConv(x)
-        return x  # (batch_size, d_model, patch_num, 1)
+        return x  # (batch_size, d_model, enc_in, patch_num)
 
 
 class UpDimensionChannelEmbedding(nn.Module):  # B x C x T
@@ -279,6 +346,7 @@ class TokenChannelEmbedding(nn.Module):
         self.patch_len_list = patch_len_list
         self.up_dim_list = up_dim_list
         self.stride_list = stride_list
+        self.enc_in = enc_in
         self.paddings = [nn.ReplicationPad1d((0, stride)) for stride in stride_list]
 
         linear_layers_t = [
@@ -350,3 +418,105 @@ class TokenChannelEmbedding(nn.Module):
             for x, cxt in zip(x_list_c, self.learnable_embeddings_c)
         ]  # (batch_size, enc_in, d_model), (batch_size, enc_in, d_model), ...
         return x_t, x_c
+
+
+class BIOTEmbedding(nn.Module):
+    def __init__(
+        self,
+        enc_in,
+        seq_len,
+        d_model,
+        patch_len,
+        stride,
+        augmentation=["none"],
+    ):
+        super().__init__()
+        # Patching
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding = nn.ReplicationPad1d((0, stride))
+
+        self.value_embedding = nn.Linear(patch_len, d_model, bias=False)
+        self.position_embedding = PositionalEmbedding(d_model)
+        self.channel_embedding = nn.Parameter(torch.randn(1, enc_in, seq_len) * 0.02)
+        patch_num = int((seq_len - patch_len) / stride + 2)
+        self.segment_embedding = nn.Parameter(torch.randn(1, patch_num * enc_in, d_model) * 0.02)
+
+        self.augmentation = nn.ModuleList(
+            [get_augmentation(aug) for aug in augmentation]
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_in", nonlinearity="leaky_relu"
+                )
+
+    def forward(self, x):  # (batch_size, seq_len, enc_in)
+        x = x.permute(0, 2, 1)  # (batch_size, enc_in, seq_len)
+        # do patching
+        batch_size, enc_in, _ = x.shape
+        aug_idx = random.randint(0, len(self.augmentation) - 1)
+        x = self.augmentation[aug_idx](x)
+        x = x + self.channel_embedding
+        x = self.padding(x)
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        x = rearrange(x, 'b e n l -> (b e) n l')  # (batch_size * enc_in, patch_num, patch_len)
+        # x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+        # Input encoding
+        x = self.value_embedding(x) + self.position_embedding(x)  # (batch_size * enc_in, patch_num, d_model)
+        x = rearrange(x, '(b e) n d -> b (e n) d', e=enc_in)  # (batch_size, enc_in * patch_num, d_model)
+        return x + self.segment_embedding
+
+
+class MultiResolutionData(nn.Module):
+    def __init__(self, enc_in, resolution_list, stride_list):
+        super().__init__()
+        self.paddings = nn.ModuleList([nn.ReplicationPad1d((0, stride)) for stride in stride_list])
+
+        self.multi_res = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=enc_in,
+                out_channels=enc_in,
+                kernel_size=res,
+                stride=res,
+                padding=0,
+                padding_mode='circular')
+            for res in resolution_list
+        ])
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x_list = []
+        for l in range(len(self.multi_res)):
+            out = self.paddings[l](x)
+            out = self.multi_res[l](out)
+            x_list.append(out)
+        return x_list
+
+
+class FrequencyEmbedding(nn.Module):
+    def __init__(self, d_model, res_len, augmentation=["none"]):
+        super().__init__()
+        self.d_model = d_model
+        self.embeddings = nn.ModuleList([
+            nn.Linear(int(res/2)+1, int(self.d_model/2)+1).to(torch.cfloat)
+            for res in res_len
+        ])
+
+        self.augmentation = nn.ModuleList(
+            [get_augmentation(aug) for aug in augmentation]
+        )
+
+    def forward(self, x_list):
+        x_out = []
+        for l in range(len(x_list)):
+            x = torch.fft.rfft(x_list[l], dim=-1)
+            out = self.embeddings[l](x)
+            out = torch.fft.irfft(out, dim=-1, n=self.d_model)
+
+            aug_idx = random.randint(0, len(self.augmentation) - 1)
+            out = self.augmentation[aug_idx](out)
+            x_out.append(out)
+
+        return x_out

@@ -11,3 +11,7 @@ sympy==1.11.1
 torch~=2.0.0
 tqdm==4.64.1
 natsort~=8.4.0
+mne==1.9.0
+mne-icalabel==0.7.0
+h5py==3.13.0
+pyedflib==0.1.40

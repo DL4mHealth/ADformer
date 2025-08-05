@@ -1,58 +1,59 @@
 import argparse
 import os
 import torch
-from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-from exp.exp_imputation import Exp_Imputation
-from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
-from exp.exp_anomaly_detection import Exp_Anomaly_Detection
-from exp.exp_classification import Exp_Classification
-from exp.exp_classification_contrastive import Exp_Classification_Contrastive
+from exp.exp_supervised import Exp_Supervised
 import random
 import numpy as np
+from utils.tools import compute_avg_std
 
 if __name__ == '__main__':
-    """fix_seed = 42
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)"""
 
-    parser = argparse.ArgumentParser(description='TimesNet')
+    parser = argparse.ArgumentParser(description='LEAD')
 
     # basic config
-    parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
-                        help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
-    parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
+    parser.add_argument('--method', type=str, required=True, default='LEAD',
+                        help='Overall method (combinations of task_name, model, model_id) name, '
+                             'options: [LEAD, MOCO, Transformer, TCN]')
+    parser.add_argument('--task_name', type=str, required=True, default='supervised',
+                        help='task name, options:[supervised]')
+    parser.add_argument('--model', type=str, required=True, default='LEAD',
+                        help='backbone model name, options: [Transformer, TCN, LEAD]')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
-    parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                        help='model name, options: [Autoformer, Transformer, TimesNet]')
+    parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
 
     # data loader
-    parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
-    parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of the data file')
+    parser.add_argument('--data', type=str, required=True, default='Single-Dataset', help='dataset type')
+    parser.add_argument('--root_path', type=str, default='./dataset/', help='root path of all dataset folders')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
-    parser.add_argument('--features', type=str, default='M',
-                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
-    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
-    parser.add_argument('--freq', type=str, default='h',
-                        help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
-    # parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
+    parser.add_argument("--pretraining_datasets", type=str,
+                        default="TDBRAIN-19",
+                        help="List of datasets folder names for pretraining (No overlapping with downstream datasets).")
+    parser.add_argument("--training_datasets", type=str,
+                        default="ADFTD-All",
+                        help="List of datasets folder names for linear probe, supervised, and finetune training.")
+    parser.add_argument("--testing_datasets", type=str,
+                        default="ADFTD-All",
+                        help="List of datasets folder names for linear probe, supervised, and finetune validation and test.")
+    parser.add_argument('--checkpoints_path', type=str, default='./checkpoints/LEAD/pretrain_lead/LEAD/P-12-Base/',
+                        help='location of pre-trained model checkpoints')
+    parser.add_argument('--classify_choice', type=str, default='multi_class',
+                        help="classify AD vs HC, AD vs Non-AD (HC and all other classes, e.g, FTD), "
+                             "HC vs Abnormal (All kinds of diseases) or multiclass, "
+                             "options:[ad_vs_hc, ad_vs_nonad, hc_vs_abnormal, multi_class]")
+    parser.add_argument('--segment_length', type=int, default=128,
+                        help='length of each EEG segment, default 128')
+    parser.add_argument('--overlapping', type=float, default=0.5,
+                        help='overlapping ratio between consecutive segments, default 0.5')
+    parser.add_argument('--sampling_rate', type=int, default=128, help='frequency sampling rate')
+    parser.add_argument('--low_cut', type=float, default=0.5, help='low cut for bandpass filter')
+    parser.add_argument('--high_cut', type=float, default=45, help='high cut for bandpass filter')
 
-    # forecasting task
-    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
-    parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
-    parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
 
-    # inputation task
-    parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
-
-    # anomaly detection task
-    parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%)')
 
     # model define for baselines
     parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
     parser.add_argument('--num_kernels', type=int, default=6, help='for Inception')
+    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
     parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
     parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
     parser.add_argument('--c_out', type=int, default=7, help='output size')
@@ -69,16 +70,20 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--embed', type=str, default='timeF',
                         help='time features encoding, options:[timeF, fixed, learned]')
+    parser.add_argument("--freq", type=str, default="h", help="freq for time features encoding, "
+                        "options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly],",)
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in encoder')
-    parser.add_argument('--chunk_size', type=int, default=16, help='chunk_size used in LightTS')
-    parser.add_argument('--patch_len', type=int, default=16, help='patch_len used in PatchTST')
+    parser.add_argument('--patch_len', type=int, default=32, help='patch_len used in PatchTST, BIOT')
     parser.add_argument('--stride', type=int, default=8, help='stride used in PatchTST')
-    parser.add_argument('--sampling_rate', type=int, default=256, help='frequency sampling rate')
-    parser.add_argument("--patch_len_list", type=str, default="1,2,4,8", help="a list of patch len used in ADformer")
-    parser.add_argument("--up_dim_list", type=str, default="19,38,76,152",
-                        help="a list of upsampling dimension used in ADformer")
-    parser.add_argument("--augmentations", type=str, default="none",
+    parser.add_argument('--resolution_list', type=str, default="2,4,6,8")
+    parser.add_argument('--nodedim', type=int, default=10)
+
+    # ADformer params
+    parser.add_argument("--patch_len_list", type=str, default="4,8", help="a list of patch len used in Medformer, ADformer")
+    parser.add_argument("--up_dim_list", type=str, default="38,76",
+                        help="a list of up dimension factor used in ADformer")
+    parser.add_argument("--augmentations", type=str, default="flip,frequency,jitter,mask,channel,drop",
                         help="a comma-seperated list of augmentation types (none, jitter or scale). "
                              "Append numbers to specify the strength of the augmentation, e.g., jitter0.1",)
     parser.add_argument("--no_inter_attn", action="store_true",
@@ -86,7 +91,7 @@ if __name__ == '__main__':
                              "using this argument means not using inter-attention", default=False)
     parser.add_argument("--no_temporal_block", action="store_true",
                         help="whether to use temporal block in encoder", default=False)
-    parser.add_argument("--no_channel_block", action="store_true",
+    parser.add_argument("--no_spatial_block", action="store_true",
                         help="whether to use channel block in encoder", default=False)
 
 
@@ -105,13 +110,19 @@ if __name__ == '__main__':
     parser.add_argument("--swa", action="store_true", help="use stochastic weight averaging", default=False)
     parser.add_argument('--no_normalize', action='store_true',
                         help='do not normalize data in data loader', default=False)
+    parser.add_argument('--single_channel_mask', type=str, default='none',
+                        help='channel mask for channel importance analysis, options: [None, Fp1, Fp2, ...]')
+    # fixed: fixed split, mccv: monte carlo cross validation,
+    # 5-fold: 5-fold cross validation, loso: leave-one-subject-out
+    parser.add_argument('--cross_val', type=str, default='mccv',
+                        help='cross validation methods, options: [fixed, mccv, 5-fold, loso]')
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
-    parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
-    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multiple gpus')
-    # parser.add_argument('--devices', type=str, default='0,1', help='device ids of multiple gpus')
+    parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=True)
+    # parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multiple gpus')
+    parser.add_argument('--devices', type=str, default='0', help='device ids of multiple gpus')
 
     # de-stationary projector params
     parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
@@ -131,22 +142,18 @@ if __name__ == '__main__':
     print('Args in experiment:')
     print(args)
 
-    if args.task_name == 'long_term_forecast':
-        Exp = Exp_Long_Term_Forecast
-    elif args.task_name == 'short_term_forecast':
-        Exp = Exp_Short_Term_Forecast
-    elif args.task_name == 'imputation':
-        Exp = Exp_Imputation
-    elif args.task_name == 'anomaly_detection':
-        Exp = Exp_Anomaly_Detection
-    elif args.task_name == 'classification':
-        Exp = Exp_Classification
-    elif args.task_name == 'classification_contrastive':
-        Exp = Exp_Classification_Contrastive
+    if args.task_name == 'supervised':
+        print("Supervised learning")
+        Exp = Exp_Supervised
     else:
-        Exp = Exp_Long_Term_Forecast
+        raise ValueError('task_name unknown, should be supervised.')
 
-    if args.is_training:
+    total_params = 0
+    sample_val_metrics_dict_list = []
+    subject_val_metrics_dict_list = []
+    sample_test_metrics_dict_list = []
+    subject_test_metrics_dict_list = []
+    if args.is_training == 1:
         for ii in range(args.itr):
             seed = 41 + ii
             random.seed(seed)
@@ -163,30 +170,41 @@ if __name__ == '__main__':
 
             # setting record of experiments
             args.seed = seed
-            setting = '{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_seed{}'.format(
-                args.model_id,
-                args.features,
-                args.seq_len,
-                args.label_len,
-                args.pred_len,
-                args.d_model,
+            setting = 'nh{}_el{}_dm{}_df{}_seed{}'.format(
+                # args.model_id,
+                # args.features,
+                # args.seq_len,
+                # args.label_len,
+                # args.pred_len,
                 args.n_heads,
                 args.e_layers,
-                args.d_layers,
+                # args.d_layers,
+                args.d_model,
                 args.d_ff,
-                args.factor,
-                args.embed,
-                args.distil,
-                args.des, args.seed)
+                # args.factor,
+                # args.embed,
+                # args.distil,
+                # args.des,
+                args.seed
+            )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting)
+            (sample_val_metrics_dict, subject_val_metrics_dict,
+             sample_test_metrics_dict, subject_test_metrics_dict, total_params) = exp.test(setting)
+            total_params = total_params
+            sample_val_metrics_dict_list.append(sample_val_metrics_dict)
+            subject_val_metrics_dict_list.append(subject_val_metrics_dict)
+            sample_test_metrics_dict_list.append(sample_test_metrics_dict)
+            subject_test_metrics_dict_list.append(subject_test_metrics_dict)
             torch.cuda.empty_cache()
-    else:
+        compute_avg_std(args, sample_val_metrics_dict_list, subject_val_metrics_dict_list,
+                        sample_test_metrics_dict_list, subject_test_metrics_dict_list, total_params)
+
+    elif args.is_training == 0:
         for ii in range(args.itr):
             seed = 41 + ii
             random.seed(seed)
@@ -202,23 +220,36 @@ if __name__ == '__main__':
                 torch.backends.cudnn.deterministic = True
 
             args.seed = seed
-            setting = '{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_seed{}'.format(
-                args.model_id,
-                args.features,
-                args.seq_len,
-                args.label_len,
-                args.pred_len,
-                args.d_model,
+            setting = 'nh{}_el{}_dm{}_df{}_seed{}'.format(
+                # args.model_id,
+                # args.features,
+                # args.seq_len,
+                # args.label_len,
+                # args.pred_len,
                 args.n_heads,
                 args.e_layers,
-                args.d_layers,
+                # args.d_layers,
+                args.d_model,
                 args.d_ff,
-                args.factor,
-                args.embed,
-                args.distil,
-                args.des, args.seed)
+                # args.factor,
+                # args.embed,
+                # args.distil,
+                # args.des,
+                args.seed
+            )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting, test=1)
+            (sample_val_metrics_dict, subject_val_metrics_dict,
+             sample_test_metrics_dict, subject_test_metrics_dict, total_params) = exp.test(setting, test=1)
+            total_params = total_params
+            sample_val_metrics_dict_list.append(sample_val_metrics_dict)
+            subject_val_metrics_dict_list.append(subject_val_metrics_dict)
+            sample_test_metrics_dict_list.append(sample_test_metrics_dict)
+            subject_test_metrics_dict_list.append(subject_test_metrics_dict)
             torch.cuda.empty_cache()
+        compute_avg_std(args, sample_val_metrics_dict_list, subject_val_metrics_dict_list,
+                        sample_test_metrics_dict_list, subject_test_metrics_dict_list, total_params)
+
+    else:
+        raise ValueError('is_training should be 1 or 0, representing training or testing.')

@@ -14,19 +14,6 @@ class Jitter(nn.Module):
         return x
 
 
-class Scale(nn.Module):
-    # scale each channel by a random scalar
-    def __init__(self, scale=0.1):
-        super().__init__()
-        self.scale = scale
-
-    def forward(self, x):
-        if self.training:
-            B, C, T = x.shape
-            x *= 1 + torch.randn(B, C, 1, device=x.device) * self.scale
-        return x
-
-
 class Flip(nn.Module):
     # left-right flip
     def __init__(self, prob=0.5):
@@ -50,6 +37,36 @@ class Shuffle(nn.Module):
             B, C, T = x.shape
             perm = torch.randperm(C)
             return x[:, perm, :]
+        return x
+
+
+class TemporalMask(nn.Module):
+    # Randomly mask a portion of timestamps across all channels
+    def __init__(self, ratio=0.1):
+        super().__init__()
+        self.ratio = ratio
+
+    def forward(self, x):
+        if self.training:
+            B, C, T = x.shape
+            num_mask = int(T * self.ratio)
+            mask_indices = torch.randperm(T)[:num_mask]
+            x[:, :, mask_indices] = 0
+        return x
+
+
+class ChannelMask(nn.Module):
+    # Randomly mask a portion of channels across all timestamps
+    def __init__(self, ratio=0.1):
+        super().__init__()
+        self.ratio = ratio
+
+    def forward(self, x):
+        if self.training:
+            B, C, T = x.shape
+            num_mask = int(C * self.ratio)
+            mask_indices = torch.randperm(C)[:num_mask]
+            x[:, mask_indices, :] = 0
         return x
 
 
@@ -77,10 +94,6 @@ def get_augmentation(augmentation):
         if len(augmentation) == 6:
             return Jitter()
         return Jitter(float(augmentation[6:]))
-    elif augmentation.startswith("scale"):
-        if len(augmentation) == 5:
-            return Scale()
-        return Scale(float(augmentation[5:]))
     elif augmentation.startswith("drop"):
         if len(augmentation) == 4:
             return nn.Dropout(0.1)
@@ -97,6 +110,14 @@ def get_augmentation(augmentation):
         if len(augmentation) == 9:
             return FrequencyMask()
         return FrequencyMask(float(augmentation[9:]))
+    elif augmentation.startswith("mask"):
+        if len(augmentation) == 4:
+            return TemporalMask()
+        return TemporalMask(float(augmentation[4:]))
+    elif augmentation.startswith("channel"):
+        if len(augmentation) == 7:
+            return ChannelMask()
+        return ChannelMask(float(augmentation[7:]))
     elif augmentation == "none":
         return nn.Identity()
     else:
